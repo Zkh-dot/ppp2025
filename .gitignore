@@ -1,0 +1,4 @@
+*.pgm
+*.ppm
+*build*
+*.tar*

@@ -1,0 +1,236 @@
+#define _GNU_SOURCE
+
+#include "parallel.h"
+
+static int np;   // total number of MPI processes
+static int self; // own process rank
+
+static bool parallel_loading; // whether to use ppp_pnm_load_part
+static bool parallel_saving;  // whether to save using MPI parallel I/O
+
+
+// load image in root process
+void load_image_single(Image* img, const char* filename) {
+    // Image *img = (Image*)malloc(sizeof(Image));
+    img->image = ppp_pnm_read(filename, &img->kind, &img->rows, &img->columns, &img->maxval);
+    if (img->image == NULL) {
+        if (self == 0) {
+            fprintf(stderr, "Could not load image from file '%s'.\n", filename);
+        }
+        free(img);
+    }
+    img->start_row = 0;
+    img->num_rows = img->rows;
+    img->estimated_global_temp = 0.0;
+}
+
+void distribute_image(Image* img) {
+    if(self != 0) {
+        return;
+    }
+
+    MPI_Bcast(&img->rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&img->columns, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&img->maxval, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&img->kind, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    int base_rows = img->rows / np;
+    int extra_rows = img->rows % np;
+    img->num_rows = base_rows + (self < extra_rows ? 1 : 0);
+
+    int offset, size;
+
+    MPI_Request *requests = malloc((np - 1) * sizeof(MPI_Request)); // ?? may be no -1
+    for(int i = 1; i < np; i++){
+        offset = i * base_rows + (i < extra_rows ? i : extra_rows) * img->columns * 3;
+        size = base_rows + (i < extra_rows ? 1 : 0) * img->columns * 3;
+        MPI_Isend(img->image + offset, size, MPI_BYTE, i, 0, MPI_COMM_WORLD, &requests[i - 1]);
+    }
+    MPI_Waitall(np - 1, requests, MPI_STATUS_IGNORE);
+    
+}
+
+void recive_image(Image* img) {
+    if(self == 0) {
+        return;
+    }
+
+    MPI_Bcast(&img->rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&img->columns, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&img->maxval, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&img->kind, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    int base_rows = img->rows / np;
+    int extra_rows = img->rows % np;
+
+    img->num_rows = base_rows + (self < extra_rows ? 1 : 0);
+    img->start_row = self * base_rows + (self < extra_rows ? self : extra_rows);
+    
+    img->image = (uint8_t *)malloc(img->num_rows * img->columns * 3);
+    img->local_size = img->num_rows * img->columns * 3;
+    
+    MPI_Recv(img->image, (base_rows + (self < extra_rows ? 1 : 0)) * img->columns * 3, MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    printf("Process %d: received sample %d %d %d\n", self, img->image[0], img->image[1], img->image[2]);
+    
+    img->estimated_global_temp = 0.0;
+}
+
+void compute_collor_sum(Image* img) {
+    long sum[3] = {0, 0, 0};
+    for (int i = 0; i < img->num_rows * img->columns; ++i) {
+        for (int j = 0; j <= 2; ++j) {
+            sum[j] += img->image[3 * i + j];
+        }
+    }
+    int pixels = img->num_rows * img->columns;
+    double estimated_local_temp = rgbToColorTemp((double)sum[0] / pixels, (double)sum[1] / pixels, (double)sum[2] / pixels);
+    printf("->Process %d: Estimated color temperature: %g K\n", self, estimated_local_temp);
+    MPI_Allreduce(&estimated_local_temp, &img->estimated_global_temp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+}
+
+void convert_color_temperature(Image* img, int from, int to) {
+    // note: it should be more efficient just to do that in each process instead of sending additional data
+    double from_r[3], to_r[3];
+    colorTempToRGB(from, &from_r[0], &from_r[1], &from_r[2]);
+    colorTempToRGB(to, &to_r[0], &to_r[1], &to_r[2]);
+    if(self == 0) {
+        printf("Adjusting color temperature from %d K to %d K.\n", from, to);
+        printf("Original color temperature %d K corresponds to RGB color (%g, %g, %g).\n", from, from_r[0],
+               from_r[1], from_r[2]);
+        printf("New color temperature %d K corresponds to RGB color (%g, %g, %g).\n", to, to_r[0], to_r[1],
+               to_r[2]);
+    }
+    for(int i = 0; i < img->num_rows * img->columns; ++i) {
+        for(int j = 0; j <= 2; ++j) {
+            img->image[3 * i + j] = rint(fmin(img->maxval, img->image[3 * i + j] * to_r[j] / from_r[j]));
+        }
+    }
+}
+
+void send_result_image(Image* img) {
+    if(self == 0) {
+        return;
+    }
+    MPI_Send(img->image, img->num_rows * img->columns * 3, MPI_BYTE, 0, 0, MPI_COMM_WORLD);
+}
+
+void collect_result_image(Image* img) {
+    printf("were --> %d\n", *(img->image+162000001) + *(img->image+162000002) + *(img->image+162000000));
+    if(self != 0) {
+        return;
+    }
+    MPI_Request *requests = malloc((np - 1) * sizeof(MPI_Request));
+    int base_rows = img->rows / np;
+    int extra_rows = img->rows % np;
+
+    for(int i = 1; i < np; i++) {
+        int num_rows = base_rows + (i < extra_rows ? 1 : 0);
+        printf("writing from pr %d %d rows to %d\n", i, num_rows * img->columns * 3, i * num_rows * img->columns * 3);
+        MPI_Irecv(img->image + i * num_rows * img->columns * 3, num_rows * img->columns * 3, MPI_BYTE, i, 0, MPI_COMM_WORLD, &requests[i - 1]);
+    }
+    MPI_Waitall(np - 1, requests, MPI_STATUS_IGNORE);
+    printf("--> %d\n", *(img->image+162000001) + *(img->image+162000002) + *(img->image+162000000));
+}
+
+void compute_parallel(const struct TaskInput *TI) {
+    double time_start, time_loaded, time_distributed;
+    double time_reduced, time_processed, time_collected;
+    double time_saved;
+
+    MPI_Comm_size(MPI_COMM_WORLD, &np);
+    MPI_Comm_rank(MPI_COMM_WORLD, &self);
+
+    if (self == 0) {
+        printf("Number of MPI processes: %d\n", np);
+#pragma omp parallel
+        {
+#pragma omp single
+            printf("Number of OMP threads in each MPI process: %d\n", omp_get_num_threads());
+        }
+    }
+    printf("Process %d: starting...\n", self);
+
+    parallel_loading = TI->parallel_loading;
+    parallel_saving = TI->parallel_saving;
+    Image *img = (Image*)malloc(sizeof(Image));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    time_start = seconds();
+
+    // TODO: load image (no idea how to do this)
+    if(TI->parallel_loading) {
+
+    } else if(self == 0) {
+        load_image_single(img, TI->filename);
+        if (img == NULL) {
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            exit(1);
+        }
+    }
+
+    time_loaded = seconds();
+
+    // TODO: distribute input image (when not using parallel loading)
+    if(!TI->parallel_loading) {
+        if(self==0) distribute_image(img);
+        else recive_image(img);
+    }
+
+    time_distributed = seconds();
+
+    printf("Process %d, image: columns: %d; rows %d; start row: %d; num_rows: %d; local_size: %d", self, img->columns, img->rows, img->start_row, img->num_rows, img->local_size);
+
+    // TODO: estimate color temperature of input image
+    if(self!=0) compute_collor_sum(img);
+    else MPI_Allreduce(&img->estimated_global_temp, &img->estimated_global_temp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    img->estimated_global_temp /= (double)np;
+    if (self == 0) {
+        printf("%d, Estimated color temperature: %g K\n", self, img->estimated_global_temp);
+    }
+
+    time_reduced = seconds();
+
+    // TODO: convert to new color temperature
+    convert_color_temperature(img, TI->originalColorTemp, TI->newColorTemp);
+
+    time_processed = seconds();
+
+    // TODO: collect output image (when not using parallel saving)
+    if(!TI->parallel_saving) {
+        if (self == 0) {
+            collect_result_image(img);
+        } else {
+            send_result_image(img);
+        }
+        
+    } else {
+        // TODO: save output image using parallel I/O
+    }
+    
+    time_collected = seconds();
+    char* filename = TI->outfilename;
+    filename[0] += self;
+    printf("=> Process %d: received sample %d %d %d\n", self, img->image[0], img->image[1], img->image[2]);
+    if(self==0)printf("==> Process %d: received sample %d %d %d\n", self, img->image[162000012], img->image[162000013], img->image[162000014]);
+    if (ppp_pnm_write(filename, img->kind, img->rows, img->columns, img->maxval, img->image) != 0) {
+        fprintf(stderr, "Could not write output image to %s\n", TI->outfilename);
+    }
+    // TODO: save output image
+
+    time_saved = seconds();
+
+    if (self == 0) {
+        printf("Times:\n"
+               "  Loading:       %.6f s\n"
+               "  Distributing:  %.6f s\n"
+               "  Reduction:     %.6f s\n"
+               "  Processing:    %.6f s\n"
+               "  Collecting:    %.6f s\n"
+               "  Saving:        %.6f s\n"
+               "  TOTAL:         %.6f s\n",
+               time_loaded - time_start, time_distributed - time_loaded, time_reduced - time_distributed,
+               time_processed - time_reduced, time_collected - time_processed, time_saved - time_collected,
+               time_saved - time_start);
+    }
+}

@@ -1,0 +1,11 @@
+add_executable(colortemp
+    main.c
+    colortemp.c
+    single.c
+    parallel.c
+)
+target_link_libraries(colortemp
+    ppp_pnm
+    m
+    ${MPI_C_LIBRARIES}
+)
