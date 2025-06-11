@@ -7,33 +7,21 @@
 #include "ppp/ppp.h"
 #include "ppp_pnm/ppp_pnm.h"
 
-/*
- * Convert a gray value in the range 0..maxcolor to a double value in [0,1].
- */
 inline static double grayvalueToDouble(uint8_t v, int maxcolor) {
     return (double)v / maxcolor;
 }
 
-/*
- * Convert a double value back to a gray value in the range 0..maxcolor.
- */
 inline static int grayvalueFromDouble(double d, int maxcolor) {
     int v = lrint(d * maxcolor);
     return (v < 0 ? 0 : (v > maxcolor ? maxcolor : v));
 }
 
-/*
- * Swap the values pointed to by 'a' and 'b'
- */
 static void swap(double **a, double **b) {
     double *tmp = *a;
     *a = *b;
     *b = tmp;
 }
 
-/*
- * Broadcast image metadata (rows, columns, maxcolor, kind) from rank 0 to all.
- */
 static void broadcast_image_info(int *rows, int *columns, int *maxcolor, enum pnm_kind *kind) {
     MPI_Bcast(rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(columns, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -41,10 +29,6 @@ static void broadcast_image_info(int *rows, int *columns, int *maxcolor, enum pn
     MPI_Bcast(kind, sizeof(enum pnm_kind), MPI_BYTE, 0, MPI_COMM_WORLD);
 }
 
-/*
- * Determine, сколько строк (без учёта ghost) получает каждый процесс,
- * и с какого глобального индекса эти строки начинаются.
- */
 static void calculate_row_distribution(int total_rows, int np, int rank,
                                        int *local_rows, int *start_row) {
     int base_rows = total_rows / np;
@@ -59,10 +43,6 @@ static void calculate_row_distribution(int total_rows, int np, int rank,
     }
 }
 
-/*
- * Distribute image data (double-значения, уже готовые в full_imageD) 
- * от процесса 0 ко всем. Каждый процесс получит ровно local_rows*columns элементов.
- */
 static void distribute_image_data(double *full_image, double *local_image,
                                   int rows, int columns, int np, int rank) {
     int *sendcounts = NULL;
@@ -93,11 +73,6 @@ static void distribute_image_data(double *full_image, double *local_image,
     }
 }
 
-/*
- * Collect image data (double-значения) от всех процессов в full_image
- * на процессе 0. Каждый процесс отсылает local_rows*columns элементов,
- * соответствующие своему «кусочку» (без учёта ghost).
- */
 static void collect_image_data(double *local_image, double *full_image,
                                int rows, int columns, int np, int rank) {
     int *recvcounts = NULL;
@@ -129,9 +104,6 @@ static void collect_image_data(double *local_image, double *full_image,
     }
 }
 
-/*
- * Load image (uint8_t) и проверка, что она типа PGM. Если ошибка — Abort.
- */
 static uint8_t* load_and_validate_image(const char* filename, enum pnm_kind *kind,
                                         int *rows, int *columns, int *maxcolor) {
     uint8_t *image = ppp_pnm_read(filename, kind, rows, columns, maxcolor);
@@ -146,14 +118,6 @@ static uint8_t* load_and_validate_image(const char* filename, enum pnm_kind *kin
     return image;
 }
 
-/*
- * Обмен «ghost rows» между соседними процессами:
- * - Если есть верхний сосед (rank>0), то process отправляет свою первую «реальную» строку
- *   (которая расположена в local_data[columns], т.к. row=0 зарезервирована под ghost-top)
- *   и принимает в local_data[0] (ghost-top).
- * - Если есть нижний сосед (rank<np-1), то отправляет последнюю «реальную» строку
- *   (индекс (local_rows-1)+ghost_top) и принимает в последнюю ghost-bottom (local_rows+ghost_top).
- */
 static void exchange_ghost_rows(double *local_data, int local_rows, int columns,
                                 int rank, int np) {
     MPI_Request requests[4];
@@ -162,38 +126,30 @@ static void exchange_ghost_rows(double *local_data, int local_rows, int columns,
     int ghost_top = (rank > 0) ? 1 : 0;
     int ghost_bottom = (rank < np - 1) ? 1 : 0;
 
-    // Если есть верхний сосед
+    
     if (rank > 0) {
-        // Отправляем первую реальную строку (y=0 ⇒ в массиве это строка index = ghost_top =1)
+        
         MPI_Isend(&local_data[ghost_top * columns], columns, MPI_DOUBLE,
                   rank - 1, 0, MPI_COMM_WORLD, &requests[req_count++]);
-        // Принимаем его «нижнюю» строку в local_data[0]
+        
         MPI_Irecv(&local_data[0], columns, MPI_DOUBLE,
                   rank - 1, 1, MPI_COMM_WORLD, &requests[req_count++]);
     }
 
-    // Если есть нижний сосед
+    
     if (rank < np - 1) {
-        // Отправляем последнюю реальную строку (y=local_rows-1 ⇒ в массиве index = (local_rows-1)+ghost_top)
+        
         MPI_Isend(&local_data[(local_rows - 1 + ghost_top) * columns], columns, MPI_DOUBLE,
                   rank + 1, 1, MPI_COMM_WORLD, &requests[req_count++]);
-        // Принимаем его «верхнюю» строку в local_data[(local_rows + ghost_top)]
+        
         MPI_Irecv(&local_data[(local_rows + ghost_top) * columns], columns, MPI_DOUBLE,
                   rank + 1, 0, MPI_COMM_WORLD, &requests[req_count++]);
     }
 
-    // Ждём завершения всех отправок/приёмов
+    
     MPI_Waitall(req_count, requests, MPI_STATUSES_IGNORE);
 }
 
-/*
- * Доступ к пикселю с учётом «ghost» (призрачных) строк.
- * Локальный массив построен так: 
- *   total_allocated_rows = local_rows + ghost_top + ghost_bottom;
- *   строки с индексом 0 и total_allocated_rows-1 (если ghost_top/bottom==1) — это ghost.
- * Если x или y «вне диапазона» (вне [0,columns-1] или вне [0, local_rows-1] без offset),
- * возвращаем 0. Иначе возвращаем local_data[(y+ghost_top)*columns + x].
- */
 inline static double get_pixel_safe(double *local_data,
                                     int x, int y,
                                     int local_rows, int columns,
@@ -206,9 +162,6 @@ inline static double get_pixel_safe(double *local_data,
     return local_data[yy * columns + x];
 }
 
-/*
- * Функции phi и xi из single.c:
- */
 #define phi(nu)                                      \
     ({                                              \
         const double chi = (nu) / kappa;            \
@@ -220,12 +173,6 @@ inline static double get_pixel_safe(double *local_data,
         (1.0 / sqrt(2.0)) * psi * exp(-psi * psi / 2.0);\
     })
 
-/*
- * Вычислить «дельту» для одного пикселя VCD (распределённая версия).
- * Здесь image — это указатель на локальный буфер (с ghost-строками),
- * x∈[0..columns-1], y∈[0..local_rows-1] (без учёта offset),
- * а ghost_top/bottom = 1 или 0 в зависимости от имеющихся соседей.
- */
 static double compute_vcd_delta_for_pixel(double *image,
                                           int x, int y,
                                           int local_rows, int columns,
@@ -233,29 +180,25 @@ static double compute_vcd_delta_for_pixel(double *image,
                                           int ghost_top, int ghost_bottom) {
     double current = get_pixel_safe(image, x, y, local_rows, columns, ghost_top, ghost_bottom);
 
-    // направленные разности
+    
     double diff_right = get_pixel_safe(image, x + 1, y, local_rows, columns, ghost_top, ghost_bottom) - current;
     double diff_left  = current - get_pixel_safe(image, x - 1, y, local_rows, columns, ghost_top, ghost_bottom);
     double diff_down  = get_pixel_safe(image, x, y + 1, local_rows, columns, ghost_top, ghost_bottom) - current;
     double diff_up    = current - get_pixel_safe(image, x, y - 1, local_rows, columns, ghost_top, ghost_bottom);
 
-    // диагональные разности
+    
     double diff_diag1 = get_pixel_safe(image, x + 1, y + 1, local_rows, columns, ghost_top, ghost_bottom) - current;
     double diff_diag2 = current - get_pixel_safe(image, x - 1, y - 1, local_rows, columns, ghost_top, ghost_bottom);
     double diff_diag3 = get_pixel_safe(image, x - 1, y + 1, local_rows, columns, ghost_top, ghost_bottom) - current;
     double diff_diag4 = current - get_pixel_safe(image, x + 1, y - 1, local_rows, columns, ghost_top, ghost_bottom);
 
-    // применяем phi и xi, как в single.c:
+    
     return phi(diff_right) - phi(diff_left)
          + phi(diff_down)  - phi(diff_up)
          + xi(diff_diag1)  - xi(diff_diag2)
          + xi(diff_diag3)  - xi(diff_diag4);
 }
 
-/*
- * Выполнить одну итерацию VCD для всего локального изображения (distributed).
- * Возвращает локальный максимум |delta|, который затем сведётся в глобальный через MPI_Allreduce.
- */
 static double perform_vcd_iteration_distributed(double **image,
                                                double **temp,
                                                int local_rows,
@@ -266,7 +209,7 @@ static double perform_vcd_iteration_distributed(double **image,
                                                int np,
                                                int global_start_row,
                                                int total_rows) {
-    // Обмен ghost rows перед вычислением
+    
     exchange_ghost_rows(*image, local_rows, columns, rank, np);
 
     double local_deltaMax = 0.0;
@@ -282,8 +225,8 @@ static double perform_vcd_iteration_distributed(double **image,
             int idx = (y + ghost_top) * columns + x;
             (*temp)[idx] = (*image)[idx] + kappa * dt * delta;
 
-            // Обновляем локальный максимум |delta| только для тех пикселей,
-            // которые в глобальном масштабе не на граничных строках и столбцах
+            
+            
             int global_y = global_start_row + y;
             if (global_y > 0 && global_y < total_rows - 1 && x > 0 && x < columns - 1) {
                 double abs_delta = fabs(delta);
@@ -294,169 +237,9 @@ static double perform_vcd_iteration_distributed(double **image,
         }
     }
 
-    // Меняем указатели, чтобы следующий раз работать с уже обновлённым изображением:
+    
     swap(image, temp);
     return local_deltaMax;
-}
-
-/*
- * Полный параллельный VCD (MPI + OpenMP).
- * Каждый процесс выполняет N итераций (или до сходимости eps),
- * а затем меняет local_image и local_temp местами.
- */
-void vcd_parallel(double **image,
-                  double **temp,
-                  int local_rows,
-                  int columns,
-                  const struct TaskInput *TI,
-                  int rank,
-                  int np,
-                  int global_start_row,
-                  int total_rows) {
-    const double kappa = TI->vcdKappa;
-    const double epsilon = TI->vcdEpsilon;
-    const double dt = TI->vcdDt;
-    const int N = TI->vcdN;
-
-    int iteration = 0;
-    double global_deltaMax = epsilon + 1.0;
-
-    while (iteration < N && global_deltaMax > epsilon) {
-        iteration++;
-        double local_deltaMax = perform_vcd_iteration_distributed(image, temp,
-                                                                 local_rows, columns,
-                                                                 kappa, dt,
-                                                                 rank, np,
-                                                                 global_start_row,
-                                                                 total_rows);
-
-        // Сводим максимум δ по всем процессам
-        MPI_Allreduce(&local_deltaMax, &global_deltaMax,
-                      1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-
-        if (TI->debugOutput && rank == 0) {
-            printf("VCD Iteration %2d: max |Δ| = %g\n", iteration, global_deltaMax);
-        }
-    }
-}
-
-/*
- * Вычислить горизонтальный (sx) и вертикальный (sy) градиенты Sobel
- * для одного пикселя (x,y) из локального буфера image (с ghost).
- */
-static void compute_sobel_gradients_distributed(double *image,
-                                                int x, int y,
-                                                int local_rows,
-                                                int columns,
-                                                double *sx,
-                                                double *sy,
-                                                int ghost_top,
-                                                int ghost_bottom) {
-    // Горизонтальный градиент (sx)
-    *sx =  get_pixel_safe(image, x - 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
-         + 2 * get_pixel_safe(image, x    , y - 1, local_rows, columns, ghost_top, ghost_bottom)
-         +   get_pixel_safe(image, x + 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
-         -   get_pixel_safe(image, x - 1, y + 1, local_rows, columns, ghost_top, ghost_bottom)
-         - 2 * get_pixel_safe(image, x    , y + 1, local_rows, columns, ghost_top, ghost_bottom)
-         -   get_pixel_safe(image, x + 1, y + 1, local_rows, columns, ghost_top, ghost_bottom);
-
-    // Вертикальный градиент (sy)
-    *sy =  get_pixel_safe(image, x - 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
-         + 2 * get_pixel_safe(image, x - 1, y    , local_rows, columns, ghost_top, ghost_bottom)
-         +   get_pixel_safe(image, x - 1, y + 1, local_rows, columns, ghost_top, ghost_bottom)
-         -   get_pixel_safe(image, x + 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
-         - 2 * get_pixel_safe(image, x + 1, y    , local_rows, columns, ghost_top, ghost_bottom)
-         -   get_pixel_safe(image, x + 1, y + 1, local_rows, columns, ghost_top, ghost_bottom);
-}
-
-/*
- * Применить оператор Собеля к локальному фрагменту (MPI + OpenMP).
- * Результат кладём в temp (double-матрицу с теми же ghost).
- */
-static void apply_sobel_operator_distributed(double **input,
-                                             double **temp,
-                                             int local_rows,
-                                             int columns,
-                                             double sobelC,
-                                             int rank,
-                                             int np) {
-    // Сначала нужно обменяться ghost-строками у входного изображения
-    exchange_ghost_rows(*input, local_rows, columns, rank, np);
-
-    int ghost_top = (rank > 0) ? 1 : 0;
-    int ghost_bottom = (rank < np - 1) ? 1 : 0;
-
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int y = 0; y < local_rows; ++y) {
-        for (int x = 0; x < columns; ++x) {
-            double sx_val, sy_val;
-            compute_sobel_gradients_distributed(*input, x, y,
-                                               local_rows, columns,
-                                               &sx_val, &sy_val,
-                                               ghost_top, ghost_bottom);
-            int idx = (y + ghost_top) * columns + x;
-            (*temp)[idx] = sobelC * hypot(sx_val, sy_val);
-        }
-    }
-
-    // Свапим указатели, чтобы в конце (*input) содержало результат
-    swap(input, temp);
-}
-
-/*
- * Оболочка над apply_sobel_operator_distributed, чтобы интерфейс был похож на single.c
- */
-void sobel_parallel(double **input, double **temp,
-                    int local_rows, int columns,
-                    double sobelC, int rank, int np) {
-    apply_sobel_operator_distributed(input, temp, local_rows, columns, sobelC, rank, np);
-}
-
-/*
- * Распечатать информацию о количестве MPI-процессов и потоков OpenMP (только rank=0).
- */
-static void print_parallel_info(int np) {
-    printf("Number of MPI processes: %d\n", np);
-    #pragma omp parallel
-    {
-        #pragma omp single
-        printf("Number of OMP threads in each MPI process: %d\n", omp_get_num_threads());
-    }
-}
-
-/*
- * Параллельная конвертация uint8 → double
- */
-static void convert_to_double_parallel(uint8_t *image, double *imageD, int size, int maxcolor) {
-    #pragma omp parallel for
-    for (int i = 0; i < size; ++i) {
-        imageD[i] = grayvalueToDouble(image[i], maxcolor);
-    }
-}
-
-/*
- * Параллельная конвертация double → uint8
- */
-static void convert_from_double_parallel(double *imageD, uint8_t *image, int size, int maxcolor) {
-    #pragma omp parallel for
-    for (int i = 0; i < size; ++i) {
-        image[i] = grayvalueFromDouble(imageD[i], maxcolor);
-    }
-}
-
-/*
- * Записать PGM-наблюдаемое в файл (тип PNM_KIND_PGM)
- */
-static void write_output_image(const char* filename,
-                               enum pnm_kind kind,
-                               int rows,
-                               int columns,
-                               int maxcolor,
-                               uint8_t *image) {
-    if (ppp_pnm_write(filename, kind, rows, columns, maxcolor, image) == -1) {
-        fprintf(stderr, "Could not write output to '%s'.\n", filename);
-        // мы не делаем MPI_Abort(), пусть все процессы завершаются корректно
-    }
 }
 
 static double compute_ghostfree_boundary_columns(double *image,
@@ -475,7 +258,7 @@ static double compute_ghostfree_boundary_columns(double *image,
     int end_row = local_rows - ghost_bottom;
 
     for (int y = start_row; y < end_row; ++y) {
-        for (int x = 0; x < columns; x += columns - 1) { // Only first and last columns
+        for (int x = 0; x < columns; x += columns - 1) { 
             double delta = compute_vcd_delta_for_pixel(image, x, y,
                                                        local_rows, columns,
                                                        kappa,
@@ -486,6 +269,27 @@ static double compute_ghostfree_boundary_columns(double *image,
     }
 
     return local_deltaMax;
+}
+
+typedef struct {
+    MPI_Request reqs[4];
+} GhostExchange;
+
+static void exchange_ghost_rows_nonblocking(
+    double *image, int local_rows, int columns,
+    int rank, int np,
+    double *ghost_top, double *ghost_bottom,
+    GhostExchange *ex)
+{
+    int above = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
+    int below = (rank < np - 1) ? rank + 1 : MPI_PROC_NULL;
+    int count = columns;
+    
+    MPI_Irecv(ghost_top,    count, MPI_DOUBLE, above, 0, MPI_COMM_WORLD, &ex->reqs[0]);
+    MPI_Irecv(ghost_bottom, count, MPI_DOUBLE, below, 1, MPI_COMM_WORLD, &ex->reqs[1]);
+    
+    MPI_Isend(image + columns,            count, MPI_DOUBLE, above, 1, MPI_COMM_WORLD, &ex->reqs[2]);
+    MPI_Isend(image + (local_rows)*columns, count, MPI_DOUBLE, below, 0, MPI_COMM_WORLD, &ex->reqs[3]);
 }
 
 static double compute_ghost_dependent_rows(double *image,
@@ -541,10 +345,10 @@ static double perform_vcd_iteration_optimized(double **image,
     int ghost_top = (rank > 0) ? 1 : 0;
     int ghost_bottom = (rank < np - 1) ? 1 : 0;
 
-    // 1. Initiate non-blocking ghost row exchange — CORRECT usage
+    
     exchange_ghost_rows(*image, local_rows, columns, rank, np);
 
-    // 2. Compute interior pixels (not using ghost rows)
+    
     double local_deltaMax = 0.0;
     int start_row = ghost_top + 1;
     int end_row = local_rows - ghost_bottom - 1;
@@ -560,7 +364,7 @@ static double perform_vcd_iteration_optimized(double **image,
         }
     }
 
-    // 3. Compute boundary columns (can be done concurrently with communication)
+    
     double side_column_deltaMax = compute_ghostfree_boundary_columns(*image, *temp,
                                                                      local_rows, columns,
                                                                      kappa, dt,
@@ -568,12 +372,12 @@ static double perform_vcd_iteration_optimized(double **image,
                                                                      global_start_row, total_rows);
     local_deltaMax = fmax(local_deltaMax, side_column_deltaMax);
 
-    // 4. Wait for ghost communication to complete before ghost-dependent computation
+    
     if (*ghost_req_count > 0) {
         MPI_Waitall(*ghost_req_count, ghost_requests, MPI_STATUSES_IGNORE);
     }
 
-    // 5. Compute ghost-dependent top/bottom rows
+    
     double ghost_row_deltaMax = compute_ghost_dependent_rows(*image, *temp,
                                                              local_rows, columns,
                                                              kappa, dt,
@@ -581,29 +385,194 @@ static double perform_vcd_iteration_optimized(double **image,
                                                              global_start_row, total_rows);
     local_deltaMax = fmax(local_deltaMax, ghost_row_deltaMax);
 
-    // 6. Swap image and temp buffers
+    
     swap(image, temp);
 
     return local_deltaMax;
 }
 
+void vcd_parallel_v2(
+    double **image,
+    double **temp,
+    int local_rows,
+    int columns,
+    const struct TaskInput *TI,
+    int rank,
+    int np,
+    int global_start_row,
+    int total_rows)
+{
+    
+    double *ghost_top    = malloc(columns * sizeof(double));
+    double *ghost_bottom = malloc(columns * sizeof(double));
+    GhostExchange ex;
+    int ghost_req_count = 4;
 
-/*
- * Основная функция для параллельного вычисления.
- * Здесь мы:
- *  1) Инициализируем MPI, узнаём rank,np
- *  2) На rank=0: загружаем изображение → uint8, конвертим в double
- *  3) Рассылаем metadata всем через broadcast
- *  4) Распределяем фрагменты full_imageD по MPI-запросу (Scatterv)
- *  5) В каждом процессе у нас локальный буфер local_imageD (с ghost-строками).
- *     Нам нужно учесть, что фактически local_data выделен больший, чем local_rows*columns:
- *       total_allocated_rows = local_rows + ghost_top + ghost_bottom
- *     Поэтому local_imageD points на сдвиг ghost_top (raw buffer).
- *  6) Применяем VCD (если надо) и/или Sobel параллельно.
- *  7) Собираем результат с учётом ghost-offset (Collect + Convert→uint8)
- *  8) На rank=0: пишем файл, освобождаем память.
- *  9) cleanup и выход.
- */
+    for (int iter = 0; iter < TI->vcdN; ++iter) {
+        
+        exchange_ghost_rows_nonblocking(
+            *image, local_rows, columns,
+            rank, np,
+            ghost_top, ghost_bottom,
+            &ex
+        );
+
+        
+        double delta_loc = perform_vcd_iteration_optimized(
+            image, temp,
+            local_rows, columns,
+            TI->vcdKappa, TI->vcdDt,
+            rank, np,
+            global_start_row, total_rows,
+            ex.reqs, &ghost_req_count
+        );
+
+        
+        swap(image, temp);
+
+        
+        double delta_glb;
+        MPI_Allreduce(&delta_loc, &delta_glb, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        if (delta_glb < TI->vcdEpsilon) break;
+    }
+
+    free(ghost_top);
+    free(ghost_bottom);
+}
+
+void vcd_parallel(double **image,
+                  double **temp,
+                  int local_rows,
+                  int columns,
+                  const struct TaskInput *TI,
+                  int rank,
+                  int np,
+                  int global_start_row,
+                  int total_rows) {
+    const double kappa = TI->vcdKappa;
+    const double epsilon = TI->vcdEpsilon;
+    const double dt = TI->vcdDt;
+    const int N = TI->vcdN;
+
+    int iteration = 0;
+    double global_deltaMax = epsilon + 1.0;
+
+    while (iteration < N && global_deltaMax > epsilon) {
+        iteration++;
+        double local_deltaMax = perform_vcd_iteration_distributed(image, temp,
+                                                                 local_rows, columns,
+                                                                 kappa, dt,
+                                                                 rank, np,
+                                                                 global_start_row,
+                                                                 total_rows);
+
+        
+        MPI_Allreduce(&local_deltaMax, &global_deltaMax,
+                      1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+        if (TI->debugOutput && rank == 0) {
+            printf("VCD Iteration %2d: max |Δ| = %g\n", iteration, global_deltaMax);
+        }
+    }
+}
+
+static void compute_sobel_gradients_distributed(double *image,
+                                                int x, int y,
+                                                int local_rows,
+                                                int columns,
+                                                double *sx,
+                                                double *sy,
+                                                int ghost_top,
+                                                int ghost_bottom) {
+    
+    *sx =  get_pixel_safe(image, x - 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
+         + 2 * get_pixel_safe(image, x    , y - 1, local_rows, columns, ghost_top, ghost_bottom)
+         +   get_pixel_safe(image, x + 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
+         -   get_pixel_safe(image, x - 1, y + 1, local_rows, columns, ghost_top, ghost_bottom)
+         - 2 * get_pixel_safe(image, x    , y + 1, local_rows, columns, ghost_top, ghost_bottom)
+         -   get_pixel_safe(image, x + 1, y + 1, local_rows, columns, ghost_top, ghost_bottom);
+
+    
+    *sy =  get_pixel_safe(image, x - 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
+         + 2 * get_pixel_safe(image, x - 1, y    , local_rows, columns, ghost_top, ghost_bottom)
+         +   get_pixel_safe(image, x - 1, y + 1, local_rows, columns, ghost_top, ghost_bottom)
+         -   get_pixel_safe(image, x + 1, y - 1, local_rows, columns, ghost_top, ghost_bottom)
+         - 2 * get_pixel_safe(image, x + 1, y    , local_rows, columns, ghost_top, ghost_bottom)
+         -   get_pixel_safe(image, x + 1, y + 1, local_rows, columns, ghost_top, ghost_bottom);
+}
+
+static void apply_sobel_operator_distributed(double **input,
+                                             double **temp,
+                                             int local_rows,
+                                             int columns,
+                                             double sobelC,
+                                             int rank,
+                                             int np) {
+    
+    exchange_ghost_rows(*input, local_rows, columns, rank, np);
+
+    int ghost_top = (rank > 0) ? 1 : 0;
+    int ghost_bottom = (rank < np - 1) ? 1 : 0;
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int y = 0; y < local_rows; ++y) {
+        for (int x = 0; x < columns; ++x) {
+            double sx_val, sy_val;
+            compute_sobel_gradients_distributed(*input, x, y,
+                                               local_rows, columns,
+                                               &sx_val, &sy_val,
+                                               ghost_top, ghost_bottom);
+            int idx = (y + ghost_top) * columns + x;
+            (*temp)[idx] = sobelC * hypot(sx_val, sy_val);
+        }
+    }
+
+    
+    swap(input, temp);
+}
+
+void sobel_parallel(double **input, double **temp,
+                    int local_rows, int columns,
+                    double sobelC, int rank, int np) {
+    apply_sobel_operator_distributed(input, temp, local_rows, columns, sobelC, rank, np);
+}
+
+static void print_parallel_info(int np) {
+    printf("Number of MPI processes: %d\n", np);
+    #pragma omp parallel
+    {
+        #pragma omp single
+        printf("Number of OMP threads in each MPI process: %d\n", omp_get_num_threads());
+    }
+}
+
+static void convert_to_double_parallel(uint8_t *image, double *imageD, int size, int maxcolor) {
+    #pragma omp parallel for
+    for (int i = 0; i < size; ++i) {
+        imageD[i] = grayvalueToDouble(image[i], maxcolor);
+    }
+}
+
+static void convert_from_double_parallel(double *imageD, uint8_t *image, int size, int maxcolor) {
+    #pragma omp parallel for
+    for (int i = 0; i < size; ++i) {
+        image[i] = grayvalueFromDouble(imageD[i], maxcolor);
+    }
+}
+
+static void write_output_image(const char* filename,
+                               enum pnm_kind kind,
+                               int rows,
+                               int columns,
+                               int maxcolor,
+                               uint8_t *image) {
+    if (ppp_pnm_write(filename, kind, rows, columns, maxcolor, image) == -1) {
+        fprintf(stderr, "Could not write output to '%s'.\n", filename);
+        
+    }
+}
+
+
 void compute_parallel(const struct TaskInput *TI) {
     int self, np;
     MPI_Comm_size(MPI_COMM_WORLD, &np);
@@ -613,7 +582,7 @@ void compute_parallel(const struct TaskInput *TI) {
         print_parallel_info(np);
     }
 
-    // 1) На rank=0: загрузка image (uint8) + metadata
+    
     enum pnm_kind kind;
     int rows = 0, columns = 0, maxcolor = 0;
     uint8_t *full_image = NULL;
@@ -626,23 +595,23 @@ void compute_parallel(const struct TaskInput *TI) {
             fprintf(stderr, "Could not allocate memory for full imageD\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        // Конвертируем uint8→double
+        
         convert_to_double_parallel(full_image, full_imageD, rows * columns, maxcolor);
     }
 
-    // 2) Рассылаем всем процессам размеры rows, columns, maxcolor, kind
+    
     broadcast_image_info(&rows, &columns, &maxcolor, &kind);
 
-    // 3) Считаем, сколько строк (без ghost) получает каждый процесс, и с какого start_row одной полосы
+    
     int local_rows, global_start_row;
     calculate_row_distribution(rows, np, self, &local_rows, &global_start_row);
 
-    // 4) Определяем, сколько ghost-строк нужно (топ и боттом)
+    
     int ghost_top    = (self > 0) ? 1 : 0;
     int ghost_bottom = (self < np - 1) ? 1 : 0;
     int total_alloc_rows = local_rows + ghost_top + ghost_bottom;
 
-    // 5) Выделяем локальные буферы под double-данные (с учётом ghost)
+    
     double *local_imageD = NULL;
     double *local_tempD  = NULL;
     int ghost_rows = ghost_top + ghost_bottom;
@@ -653,26 +622,19 @@ void compute_parallel(const struct TaskInput *TI) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    /*
-     * 6) Распределяем данные full_imageD (double-значения) по процессам.
-     *    Однако функция Scatterv работает только с непрерывным буфером без «пробелов».
-     *    Поэтому нам нужно в каждом процессе скопировать свои «local_rows*columns» значений
-     *    в диапазон local_imageD[ghost_top*columns … (ghost_top+local_rows-1)*columns] 
-     *    (вне ghost).
-     */
     {
-        // временный буфер для приёма без учёта ghost
+        
         double *temp_recv = (double *)malloc(local_rows * columns * sizeof(double));
         if (temp_recv == NULL) {
             fprintf(stderr, "Could not allocate temp_recv on rank %d\n", self);
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        // Рассылаем фрагмент изображения
+        
         distribute_image_data(full_imageD, temp_recv, rows, columns, np, self);
 
-        // Заполняем local_imageD так, чтобы учесть ghost_top
-        // Копируем каждую строку: temp_recv[y*columns + x] → local_imageD[(y+ghost_top)*columns + x]
+        
+        
         #pragma omp parallel for collapse(2) schedule(static)
         for (int y = 0; y < local_rows; y++) {
             for (int x = 0; x < columns; x++) {
@@ -683,32 +645,19 @@ void compute_parallel(const struct TaskInput *TI) {
         free(temp_recv);
     }
 
-    /*
-     * 7) Запускаем VCD-процедуру (MPI+OpenMP) или нет:
-     *     В single.c наверняка есть флаг TI->doVcd (либо похожий), 
-     *     проверяем его и запускаем:
-     */
     if (TI->doVCD) {
-        vcd_parallel(&local_imageD, &local_tempD,
+        vcd_parallel_v2(&local_imageD, &local_tempD,
                      local_rows, columns,
                      TI, self, np, global_start_row, rows);
     }
 
-    /*
-     * 8) Запускаем Sobel (MPI+OpenMP) или нет:
-     *     Если нужно после VCD сделать Sobel, то перед этим local_imageD
-     *     уже содержит результат VCD, и мы можем выполнять Sobel.
-     */
+
     if (TI->doSobel) {
         sobel_parallel(&local_imageD, &local_tempD,
                        local_rows, columns,
                        TI->sobelC, self, np);
     }
 
-    /*
-     * 9) Собираем собранное изображение из local_imageD без учёта ghost:
-     *    Сначала готовим отдельный буфер «без ghost», затем загоняем в Gatherv.
-     */
     uint8_t *full_image_out = NULL;
     double  *full_imageD_out = NULL;
     if (self == 0) {
@@ -719,7 +668,7 @@ void compute_parallel(const struct TaskInput *TI) {
         }
     }
 
-    // Сначала копируем только «реальные» строки (ghost_top..ghost_top+local_rows-1)
+    
     {
         double *temp_send = (double *)malloc(local_rows * columns * sizeof(double));
         if (temp_send == NULL) {
@@ -734,14 +683,14 @@ void compute_parallel(const struct TaskInput *TI) {
             }
         }
 
-        // Собираем на rank=0
+        
         collect_image_data(temp_send, full_imageD_out,
                            rows, columns, np, self);
 
         free(temp_send);
     }
 
-    // 10) На rank=0: преобразуем full_imageD_out (double) → uint8 и записываем файл.
+    
     if (self == 0) {
         full_image_out = (uint8_t *)malloc(rows * columns * sizeof(uint8_t));
         if (full_image_out == NULL) {
@@ -755,16 +704,13 @@ void compute_parallel(const struct TaskInput *TI) {
             write_output_image(TI->outfilename, kind, rows, columns, maxcolor, full_image_out);
         }
 
-        // Опционально можно вывести общее время (если TI даёт time_loaded/time_computed)
-        // printf("Computation time: %.6f\n", time_computed - time_loaded);
-
         free(full_image_out);
         free(full_imageD_out);
         free(full_image);
         free(full_imageD);
     }
 
-    // 11) Локальная очистка
+    
     free(local_imageD);
     free(local_tempD);
 }
