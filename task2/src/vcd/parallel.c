@@ -459,6 +459,135 @@ static void write_output_image(const char* filename,
     }
 }
 
+static double compute_ghostfree_boundary_columns(double *image,
+                                                 double *temp,
+                                                 int local_rows,
+                                                 int columns,
+                                                 double kappa,
+                                                 double dt,
+                                                 int ghost_top,
+                                                 int ghost_bottom,
+                                                 int global_start_row,
+                                                 int total_rows) {
+    double local_deltaMax = 0.0;
+
+    int start_row = ghost_top;
+    int end_row = local_rows - ghost_bottom;
+
+    for (int y = start_row; y < end_row; ++y) {
+        for (int x = 0; x < columns; x += columns - 1) { // Only first and last columns
+            double delta = compute_vcd_delta_for_pixel(image, x, y,
+                                                       local_rows, columns,
+                                                       kappa,
+                                                       ghost_top, ghost_bottom);
+            temp[y * columns + x] = image[y * columns + x] + delta * dt;
+            local_deltaMax = fmax(local_deltaMax, fabs(delta));
+        }
+    }
+
+    return local_deltaMax;
+}
+
+static double compute_ghost_dependent_rows(double *image,
+                                           double *temp,
+                                           int local_rows,
+                                           int columns,
+                                           double kappa,
+                                           double dt,
+                                           int ghost_top,
+                                           int ghost_bottom,
+                                           int global_start_row,
+                                           int total_rows) {
+    double local_deltaMax = 0.0;
+
+    if (ghost_top) {
+        int y = 0;
+        for (int x = 0; x < columns; ++x) {
+            double delta = compute_vcd_delta_for_pixel(image, x, y,
+                                                       local_rows, columns,
+                                                       kappa,
+                                                       ghost_top, ghost_bottom);
+            temp[y * columns + x] = image[y * columns + x] + delta * dt;
+            local_deltaMax = fmax(local_deltaMax, fabs(delta));
+        }
+    }
+
+    if (ghost_bottom) {
+        int y = local_rows - 1;
+        for (int x = 0; x < columns; ++x) {
+            double delta = compute_vcd_delta_for_pixel(image, x, y,
+                                                       local_rows, columns,
+                                                       kappa,
+                                                       ghost_top, ghost_bottom);
+            temp[y * columns + x] = image[y * columns + x] + delta * dt;
+            local_deltaMax = fmax(local_deltaMax, fabs(delta));
+        }
+    }
+
+    return local_deltaMax;
+}
+static double perform_vcd_iteration_optimized(double **image,
+                                              double **temp,
+                                              int local_rows,
+                                              int columns,
+                                              double kappa,
+                                              double dt,
+                                              int rank,
+                                              int np,
+                                              int global_start_row,
+                                              int total_rows,
+                                              MPI_Request *ghost_requests,
+                                              int *ghost_req_count) {
+    int ghost_top = (rank > 0) ? 1 : 0;
+    int ghost_bottom = (rank < np - 1) ? 1 : 0;
+
+    // 1. Initiate non-blocking ghost row exchange — CORRECT usage
+    exchange_ghost_rows(*image, local_rows, columns, rank, np);
+
+    // 2. Compute interior pixels (not using ghost rows)
+    double local_deltaMax = 0.0;
+    int start_row = ghost_top + 1;
+    int end_row = local_rows - ghost_bottom - 1;
+
+    for (int y = start_row; y <= end_row; ++y) {
+        for (int x = 1; x < columns - 1; ++x) {
+            double delta = compute_vcd_delta_for_pixel(*image, x, y,
+                                                       local_rows, columns,
+                                                       kappa,
+                                                       ghost_top, ghost_bottom);
+            (*temp)[y * columns + x] = (*image)[y * columns + x] + delta * dt;
+            local_deltaMax = fmax(local_deltaMax, fabs(delta));
+        }
+    }
+
+    // 3. Compute boundary columns (can be done concurrently with communication)
+    double side_column_deltaMax = compute_ghostfree_boundary_columns(*image, *temp,
+                                                                     local_rows, columns,
+                                                                     kappa, dt,
+                                                                     ghost_top, ghost_bottom,
+                                                                     global_start_row, total_rows);
+    local_deltaMax = fmax(local_deltaMax, side_column_deltaMax);
+
+    // 4. Wait for ghost communication to complete before ghost-dependent computation
+    if (*ghost_req_count > 0) {
+        MPI_Waitall(*ghost_req_count, ghost_requests, MPI_STATUSES_IGNORE);
+    }
+
+    // 5. Compute ghost-dependent top/bottom rows
+    double ghost_row_deltaMax = compute_ghost_dependent_rows(*image, *temp,
+                                                             local_rows, columns,
+                                                             kappa, dt,
+                                                             ghost_top, ghost_bottom,
+                                                             global_start_row, total_rows);
+    local_deltaMax = fmax(local_deltaMax, ghost_row_deltaMax);
+
+    // 6. Swap image and temp buffers
+    swap(image, temp);
+
+    return local_deltaMax;
+}
+
+
 /*
  * Основная функция для параллельного вычисления.
  * Здесь мы:
